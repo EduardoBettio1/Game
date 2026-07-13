@@ -1,0 +1,149 @@
+# Code Overview
+
+How `tetris.cpp` is put together, top to bottom. It's one file, split into
+a thin platform-specific layer and a shared game core that doesn't care
+what OS it's running on.
+
+## 1. Platform layer (`setupTerminal` / `restoreTerminal` / `processInput`)
+
+Everything platform-specific is wrapped in `#ifdef _WIN32` / `#else`, so
+the file compiles differently depending on OS but the game logic below it
+never changes.
+
+**Windows side:** turns on `ENABLE_VIRTUAL_TERMINAL_PROCESSING` via
+`SetConsoleMode`, which tells the Windows console to understand ANSI
+escape codes (colors, cursor movement) the same way a Linux/macOS
+terminal does. Input is read with `_kbhit()` (is a key waiting?) and
+`_getch()` (read it), both from `<conio.h>`.
+
+**Linux/macOS side:** puts the terminal into "raw mode" with `termios` —
+this turns off line buffering and character echo, so key presses are
+available to the program the instant they happen instead of waiting for
+Enter. `fcntl(..., O_NONBLOCK)` makes `read()` return immediately even if
+no key was pressed, instead of freezing the game waiting for input.
+
+Both sides restore the terminal to normal on exit (`restoreTerminal`,
+registered with `std::atexit`) so closing the game doesn't leave your
+terminal in a broken state.
+
+## 2. Representing the pieces
+
+```cpp
+using Shape = std::array<std::array<int, 4>, 4>;
+```
+
+Each of the 7 tetrominoes is stored as a single 4×4 grid of 0s and 1s, in
+its spawn orientation only — there's no hand-written table of "here's what
+the T piece looks like in each of its 4 rotations." Instead, rotation is
+computed:
+
+```cpp
+Shape rotateCW(const Shape& m) {
+    Shape r{};
+    for (int row = 0; row < 4; row++)
+        for (int col = 0; col < 4; col++)
+            r[col][3 - row] = m[row][col];
+    return r;
+}
+```
+
+This is the standard "rotate a matrix 90 degrees" formula: each cell
+`(row, col)` moves to `(col, 3-row)`. Call it once and you get the next
+rotation state, call it four times and you're back where you started.
+Same trick works for all 7 shapes with zero piece-specific code.
+
+## 3. The board and the falling piece
+
+The board is `std::vector<std::vector<int>> board`, sized 20 rows × 10
+columns. Each cell is either `-1` (empty) or a piece-type index `0`–`6`
+(which also doubles as the index into the `COLOR` table for rendering).
+
+The currently-falling piece is a separate `Piece` struct (its shape, and
+its row/col position on the board) — it does **not** live inside `board`
+until it locks in place. This keeps collision checking and rotation simple
+since you're only ever testing the 4×4 piece grid against the board, not
+hunting for which cells belong to the "live" piece.
+
+## 4. Collision, locking, and clearing lines
+
+`collides(shape, row, col)` checks every filled cell of a 4×4 shape
+against the board: is it off the left/right edge, off the bottom, or
+overlapping a cell that's already filled? This one function is reused for
+every kind of movement check — moving sideways, dropping down, and
+rotating all just call `collides` with different candidate positions and
+back out if it returns true.
+
+When a piece can't move down anymore, `lockPiece()` copies its cells into
+the permanent `board` array. Then `clearLines()` scans from the bottom row
+up, and any row with no `-1` cells gets erased and a blank row inserted at
+the top — which is what makes the whole stack visually "fall" down to fill
+the gap.
+
+## 5. Piece spawning: the 7-bag randomizer
+
+```cpp
+int nextFromBag() {
+    if (bag.empty()) {
+        bag = {0, 1, 2, 3, 4, 5, 6};
+        std::shuffle(bag.begin(), bag.end(), rng);
+    }
+    ...
+}
+```
+
+Instead of picking a fully random piece every time (which can give you
+brutal droughts — no I-piece for 20 pieces in a row), the game shuffles a
+bag containing one of each of the 7 pieces and hands them out one at a
+time. When the bag empties, it's refilled and reshuffled. This is the same
+approach modern Tetris games use, and it's also why the game can always
+show you the correct next piece — it just peeks at what's already sitting
+in the bag.
+
+## 6. Rendering
+
+Every frame, `render()`:
+
+1. Copies `board` into a temporary `view` grid and stamps the falling
+   piece's cells on top of it — so the falling piece is drawn the exact
+   same way as locked pieces, no separate drawing code needed.
+2. Walks the grid row by row, printing two spaces with an ANSI background
+   color (`\033[48;5;<n>m`) for each filled cell, or two blank spaces for
+   empty ones.
+3. Prints the sidebar (next piece, score, lines, level, controls) by
+   checking `if (r == <some row number>)` as it goes — cheap and simple
+   since the sidebar only has a handful of lines.
+4. Instead of clearing the whole screen and redrawing (which flickers),
+   it moves the cursor back to the top-left with `\033[H` and overwrites
+   in place, using `\033[K` at the end of each line to erase any leftover
+   characters from a longer previous frame.
+
+## 7. The main loop
+
+```cpp
+while (running) {
+    processInput(running);
+    if (!gameOver) {
+        // move the piece down once gravityMs has elapsed
+        render();
+    } else {
+        renderGameOver();
+    }
+    std::this_thread::sleep_for(milliseconds(16));
+}
+```
+
+The loop runs roughly 60 times a second (`sleep_for(16ms)`), checking for
+input every iteration. Gravity is decoupled from the frame rate — it only
+triggers a downward move once `gravityMs` has actually elapsed, using
+`std::chrono::steady_clock` to track real time. `gravityMs` shrinks as
+`level` increases (capped at a minimum of 100ms), which is what makes the
+game speed up over time.
+
+## Where to make changes
+
+- **Board size:** change `COLS` / `ROWS` at the top.
+- **Colors:** edit the `COLOR` array (values are 256-color ANSI codes).
+- **Difficulty curve:** tweak the `gravityMs` formula in `main()`.
+- **Scoring:** edit the `TABLE` array inside `clearLines()`.
+- **Controls:** both `processInput` variants use plain `switch` statements
+  — add a case to either one to add a new key.
